@@ -55,13 +55,13 @@ export function stageShot(name, world) {
     if (waitingOrder) {
       waitingOrder.state = ORDER_STATE.CLAIMED;
       world.state.claimedOrder = waitingOrder;
+      world.state.score = 650;
+      world.state.money = 124;
       world.interactStation('broth', waitingOrder.broth);
+      world.interactStation('noodles');
       world.state.boiler.timer = 5.0;
       world.interactStation('noodles');
       waitingOrder.toppings.forEach(t => world.interactStation('toppings', t));
-    }
-    for (let i = 0; i < 30; i++) {
-      world.step(STEP, { x: 0, y: 0 }, 0, null, true);
     }
     return { screen: SCREEN_PLAY, best: 850 };
   }
