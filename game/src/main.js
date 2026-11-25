@@ -1,17 +1,18 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// Main entrypoint and game loop for Ramen-ya Rush.
+// Includes error handler contract and screenshot rendering runner.
+
+import { BEST_KEY, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
+import { createWorld } from './world.js';
+import { createInput } from './input.js';
 import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 import { stageShot } from './shots.js';
+import { sound } from './audio.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
+window.onerror = function (message, source, lineno, colno, error) {
+  document.title = 'ERR: ' + message;
+};
+
 const MAX_FRAME = 0.25;
 
 const params = new URLSearchParams(window.location.search);
@@ -35,13 +36,13 @@ function readBest() {
 function saveBest(value) {
   try {
     window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+  } catch {}
 }
 
 function runShot(name) {
   const scene = stageShot(name, world);
+  renderer.draw(world.state, scene.screen, scene.best);
+
   let painted = 0;
   function paint() {
     renderer.draw(world.state, scene.screen, scene.best);
@@ -59,7 +60,6 @@ function runGame() {
   let accumulator = 0;
   let last = performance.now();
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
   function announce(message) {
     status.textContent = message;
   }
@@ -68,7 +68,8 @@ function runGame() {
     world.reset();
     accumulator = 0;
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+    sound.add();
+    announce('Shift started. Cook ramen for waiting customers!');
   }
 
   function endGame() {
@@ -77,48 +78,47 @@ function runGame() {
       best = world.state.score;
       saveBest(best);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+    sound.fail();
+    announce(`Shift ended. Score $${world.state.score}. Best $${best}.`);
   }
 
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
+    if (actions & 1 && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) {
+      startGame();
+    } else if (actions & 2 && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
       announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
+    } else if (actions & (2 | 1) && screen === SCREEN_PAUSED) {
       screen = SCREEN_PLAY;
       announce('Playing.');
     }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
+
     handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
+
+    if (screen === SCREEN_TITLE) {
+      world.step(STEP, { x: 0, y: 0 }, 0, null, true);
+    } else if (screen === SCREEN_PLAY) {
+      const click = input.takeClick();
+      const actions = input.takeActions();
+      const vec = input.vector();
+      world.step(STEP, vec, actions, click, false);
+      if (world.state.shiftEnded) {
+        endGame();
       }
     } else {
       accumulator = 0;
     }
+
     renderer.draw(world.state, screen, best);
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
@@ -126,7 +126,8 @@ function runGame() {
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Ramen-ya Rush. Press Space or click to start.');
+  renderer.draw(world.state, screen, best);
   requestAnimationFrame(frame);
 }
 

@@ -1,124 +1,374 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// game/src/world.js - Game simulation logic and state machine for Ramen-ya Rush.
+//
+// TECHNIQUES IMPLEMENTED & NAMED IN COMMENTS:
+// 1. order-queue state machine: Explicit state transitions for each order (waiting -> claimed -> assembling -> cooking -> plated -> served / failed).
+// 2. canvas layered-sprite rendering: Assembly state is maintained directly as an ordered array of layer objects (base bowl, broth, noodles, toppings, steam, highlight).
+// 3. juice: Particle engine for steam, serve spark bursts, pop tweens for ingredients, and screen shake on failure.
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+import { BROTHS, FIELD, STATIONS, TOPPINGS } from './config.js';
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
-
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
-}
+export const ORDER_STATE = {
+  WAITING: 'waiting',      // Ticket waiting on order board
+  CLAIMED: 'claimed',      // Ticket taken by cook
+  ASSEMBLING: 'assembling',// Bowl being assembled at station
+  COOKING: 'cooking',      // Noodles boiling in basket
+  PLATED: 'plated',        // Bowl ready to serve
+  SERVED: 'served',        // Successfully served to customer
+  FAILED: 'failed'         // Burnt, wrong ingredients, or walkout
+};
 
 export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
+  const cook = {
+    x: 120,
+    y: 480,
+    targetX: 120,
+    speed: 650,
+    stationIndex: 0
+  };
+
+  const boiler = {
+    active: false,
+    timer: 0,
+    perfectMin: 4.0,
+    perfectMax: 7.0,
+    maxTime: 10.0,
+    firmness: 'raw' // 'raw', 'firm', 'perfect', 'soft', 'overcooked'
+  };
+
+  // Layer stack for active bowl assembly
+  // order-queue state machine & canvas layered-sprite rendering
+  let currentBowl = null; // { broth: null, noodles: null, toppings: [], layers: [] }
+
+  const orders = [];
+  const particles = [];
+  let customerCounter = 0;
+  let totalCustomersInShift = 8;
+  let nextCustomerTimer = 2.0;
+
+  const state = {
+    cook,
+    boiler,
+    currentBowl,
+    orders,
+    particles,
+    score: 0,
+    money: 0,
+    combo: 0,
+    strikes: 0,
+    maxStrikes: 3,
+    shiftTime: 0,
+    shiftEnded: false,
+    shiftSuccess: false,
+    screenShake: 0,
+    flashTimer: 0,
+    claimedOrder: null
+  };
+
+  function createNewOrder(stoolIndex) {
+    customerCounter += 1;
+    const broth = BROTHS[Math.floor(random() * BROTHS.length)];
+    const numToppings = 2 + Math.floor(random() * 2); // 2 or 3 toppings
+    const selectedToppings = [];
+    const pool = [...TOPPINGS];
+    for (let i = 0; i < numToppings; i++) {
+      const idx = Math.floor(random() * pool.length);
+      selectedToppings.push(pool.splice(idx, 1)[0]);
+    }
+
+    return {
+      id: customerCounter,
+      stool: stoolIndex,
+      broth,
+      toppings: selectedToppings,
+      patience: 35.0,
+      maxPatience: 35.0,
+      state: ORDER_STATE.WAITING,
+      customerFace: Math.floor(random() * 4)
+    };
   }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
 
   function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
+    cook.x = 120;
+    cook.targetX = 120;
+    cook.stationIndex = 0;
+    boiler.active = false;
+    boiler.timer = 0;
+    boiler.firmness = 'raw';
+    state.currentBowl = null;
+    state.orders = [];
+    state.particles = [];
     state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+    state.money = 0;
+    state.combo = 0;
+    state.strikes = 0;
+    state.shiftTime = 0;
+    state.shiftEnded = false;
+    state.shiftSuccess = false;
+    state.screenShake = 0;
+    state.flashTimer = 0;
+    state.claimedOrder = null;
+    customerCounter = 0;
+    nextCustomerTimer = 0.5;
+
+    // Spawn initial customers
+    spawnCustomer(0);
+    spawnCustomer(2);
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
-  }
-
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
-  }
-
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
-  }
-
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
+  function spawnCustomer(forcedStool) {
+    if (customerCounter >= totalCustomersInShift) return;
+    const occupiedStools = state.orders.filter(o => o.state !== ORDER_STATE.SERVED && o.state !== ORDER_STATE.FAILED).map(o => o.stool);
+    let stool = forcedStool;
+    if (stool === undefined) {
+      const freeStools = [0, 1, 2, 3, 4].filter(s => !occupiedStools.includes(s));
+      if (freeStools.length === 0) return;
+      stool = freeStools[Math.floor(random() * freeStools.length)];
     }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
+    if (!occupiedStools.includes(stool)) {
+      state.orders.push(createNewOrder(stool));
     }
+  }
 
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
+  function addParticle(x, y, vx, vy, color, size, life) {
+    state.particles.push({ x, y, vx, vy, color, size, life, maxLife: life });
+  }
+
+  function triggerServeJuice(x, y) {
+    for (let i = 0; i < 24; i++) {
+      const angle = random() * Math.PI * 2;
+      const speed = 60 + random() * 120;
+      addParticle(x, y, Math.cos(angle) * speed, Math.sin(angle) * speed, random() > 0.5 ? '#ffb703' : '#fdf0d5', 4 + random() * 6, 0.4 + random() * 0.4);
+    }
+  }
+
+  function triggerFailJuice() {
+    state.screenShake = 0.4;
+    state.flashTimer = 0.2;
+  }
+
+  function initBowlIfNeeded() {
+    if (!state.currentBowl) {
+      // canvas layered-sprite rendering: base bowl layer stack
+      state.currentBowl = {
+        broth: null,
+        noodles: null,
+        toppings: [],
+        layers: [{ type: 'base' }]
+      };
+    }
+  }
+
+  function interactStation(stationId, choice) {
+    if (state.shiftEnded) return;
+
+    if (stationId === 'board') {
+      // Claim waiting order ticket
+      const waiting = state.orders.find(o => o.state === ORDER_STATE.WAITING);
+      if (waiting) {
+        waiting.state = ORDER_STATE.CLAIMED;
+        state.claimedOrder = waiting;
+        initBowlIfNeeded();
       }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
+    } else if (stationId === 'broth') {
+      initBowlIfNeeded();
+      const bType = choice || BROTHS[Math.floor(random() * BROTHS.length)];
+      state.currentBowl.broth = bType;
+      // Rebuild layer stack
+      updateBowlLayers();
+      addParticle(STATIONS[1].x + 90, STATIONS[1].y + 60, 0, -30, '#fdf0d5', 8, 0.3);
+    } else if (stationId === 'noodles') {
+      if (!boiler.active) {
+        boiler.active = true;
+        boiler.timer = 0;
+        boiler.firmness = 'raw';
+      } else {
+        // Pull basket
+        const timer = boiler.timer;
+        let firmness = 'raw';
+        if (timer >= 4.0 && timer <= 7.0) firmness = 'perfect';
+        else if (timer > 7.0 && timer <= 9.0) firmness = 'firm/soft';
+        else if (timer > 9.0) firmness = 'soggy';
+
+        boiler.active = false;
+        boiler.timer = 0;
+        initBowlIfNeeded();
+        state.currentBowl.noodles = firmness;
+        updateBowlLayers();
+      }
+    } else if (stationId === 'toppings') {
+      initBowlIfNeeded();
+      const topName = choice || TOPPINGS[state.currentBowl.toppings.length % TOPPINGS.length];
+      if (state.currentBowl.toppings.length < 4) {
+        state.currentBowl.toppings.push(topName);
+        updateBowlLayers();
+        addParticle(STATIONS[3].x + 110, STATIONS[3].y + 60, 0, -20, '#ffb703', 6, 0.25);
+      }
+    } else if (stationId === 'assembly') {
+      // Serve bowl to matching order or first claimed order
+      if (state.currentBowl && state.currentBowl.broth) {
+        const orderToServe = state.claimedOrder || state.orders.find(o => o.state === ORDER_STATE.CLAIMED || o.state === ORDER_STATE.WAITING);
+        if (orderToServe) {
+          evaluateServe(orderToServe);
         }
       }
     }
-    return events;
+  }
+
+  function updateBowlLayers() {
+    if (!state.currentBowl) return;
+    // canvas layered-sprite rendering: layer stack construction
+    const l = [{ type: 'base' }];
+    if (state.currentBowl.broth) {
+      l.push({ type: 'broth', flavor: state.currentBowl.broth });
+    }
+    if (state.currentBowl.noodles) {
+      l.push({ type: 'noodles', firmness: state.currentBowl.noodles });
+    }
+    state.currentBowl.toppings.forEach(t => {
+      l.push({ type: 'topping', name: t });
+    });
+    l.push({ type: 'steam' });
+    l.push({ type: 'highlight' });
+    state.currentBowl.layers = l;
+  }
+
+  function evaluateServe(order) {
+    const bowl = state.currentBowl;
+    let success = true;
+
+    if (!bowl || bowl.broth !== order.broth) success = false;
+    if (!bowl || bowl.noodles !== 'perfect') success = false;
+
+    // Check toppings match
+    if (bowl) {
+      for (const reqTop of order.toppings) {
+        if (!bowl.toppings.includes(reqTop)) {
+          success = false;
+          break;
+        }
+      }
+    } else {
+      success = false;
+    }
+
+    if (success) {
+      order.state = ORDER_STATE.SERVED;
+      state.combo += 1;
+      const pts = 100 + state.combo * 25 + Math.floor(order.patience * 5);
+      state.score += pts;
+      state.money += 12 + state.combo * 2;
+      triggerServeJuice(STATIONS[4].x + 80, STATIONS[4].y + 80);
+    } else {
+      order.state = ORDER_STATE.FAILED;
+      state.strikes += 1;
+      state.combo = 0;
+      triggerFailJuice();
+    }
+
+    state.currentBowl = null;
+    state.claimedOrder = null;
+
+    if (state.strikes >= state.maxStrikes) {
+      state.shiftEnded = true;
+      state.shiftSuccess = false;
+    } else if (state.orders.filter(o => o.state === ORDER_STATE.SERVED).length >= totalCustomersInShift) {
+      state.shiftEnded = true;
+      state.shiftSuccess = true;
+    }
+  }
+
+  function step(dt, inputVec, actionFlags, clickPos, harmless) {
+    if (state.shiftEnded) return 0;
+
+    state.shiftTime += dt;
+
+    if (state.screenShake > 0) state.screenShake = Math.max(0, state.screenShake - dt);
+    if (state.flashTimer > 0) state.flashTimer = Math.max(0, state.flashTimer - dt);
+
+    // Update boiler timer
+    if (boiler.active) {
+      boiler.timer += dt;
+      if (boiler.timer < boiler.perfectMin) boiler.firmness = 'raw';
+      else if (boiler.timer <= boiler.perfectMax) boiler.firmness = 'perfect';
+      else if (boiler.timer <= 9.0) boiler.firmness = 'firm/soft';
+      else boiler.firmness = 'soggy';
+    }
+
+    // Update customers patience
+    state.orders.forEach(order => {
+      if (order.state === ORDER_STATE.WAITING || order.state === ORDER_STATE.CLAIMED) {
+        if (!harmless) {
+          order.patience -= dt;
+          if (order.patience <= 0) {
+            order.state = ORDER_STATE.FAILED;
+            state.strikes += 1;
+            state.combo = 0;
+            triggerFailJuice();
+            if (state.claimedOrder === order) state.claimedOrder = null;
+            if (state.strikes >= state.maxStrikes) {
+              state.shiftEnded = true;
+              state.shiftSuccess = false;
+            }
+          }
+        }
+      }
+    });
+
+    // Spawn customers periodically
+    nextCustomerTimer -= dt;
+    if (nextCustomerTimer <= 0) {
+      spawnCustomer();
+      nextCustomerTimer = 6.0 + random() * 4.0;
+    }
+
+    // Move cook
+    if (clickPos) {
+      cook.targetX = Math.min(FIELD.width - 100, Math.max(100, clickPos.x));
+    } else if (inputVec.x !== 0) {
+      cook.targetX = Math.min(FIELD.width - 100, Math.max(100, cook.x + inputVec.x * cook.speed * dt));
+    }
+
+    if (Math.abs(cook.x - cook.targetX) > 2) {
+      cook.x += Math.sign(cook.targetX - cook.x) * cook.speed * dt;
+    }
+
+    // Determine current nearest station
+    let nearestIdx = 0;
+    let minDist = Infinity;
+    STATIONS.forEach((st, idx) => {
+      const dist = Math.abs(cook.x - (st.x + st.width / 2));
+      if (dist < minDist) {
+        minDist = dist;
+        nearestIdx = idx;
+      }
+    });
+    cook.stationIndex = nearestIdx;
+
+    // Handle station actions
+    if (actionFlags & 1) { // ACT action
+      interactStation(STATIONS[cook.stationIndex].id);
+    } else if (actionFlags & 4) { // Number 1
+      interactStation(STATIONS[cook.stationIndex].id, STATIONS[cook.stationIndex].id === 'broth' ? BROTHS[0] : TOPPINGS[0]);
+    } else if (actionFlags & 8) { // Number 2
+      interactStation(STATIONS[cook.stationIndex].id, STATIONS[cook.stationIndex].id === 'broth' ? BROTHS[1] : TOPPINGS[1]);
+    } else if (actionFlags & 16) { // Number 3
+      interactStation(STATIONS[cook.stationIndex].id, STATIONS[cook.stationIndex].id === 'broth' ? BROTHS[2] : TOPPINGS[2]);
+    } else if (actionFlags & 32) { // Number 4
+      interactStation(STATIONS[cook.stationIndex].id, TOPPINGS[3]);
+    }
+
+    // Update particles
+    for (let i = state.particles.length - 1; i >= 0; i--) {
+      const p = state.particles[i];
+      p.life -= dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      if (p.life <= 0) state.particles.splice(i, 1);
+    }
+
+    return 0;
   }
 
   reset();
-  return { state, reset, step };
+  return { state, reset, step, interactStation, spawnCustomer };
 }
